@@ -32,6 +32,10 @@
 #define ADDR_MAX_SAFE_TEMP 16
 #define ADDR_MIN_SAFE_TEMP 20
 #define ADDR_ALARMS_ENABLED 24  // uint8_t
+#define ADDR_SAFETY_MODE 25     // uint8_t
+#define ADDR_SAFETY_DELTA 26    // float (4 bytes)
+
+
 
 
 
@@ -142,6 +146,8 @@ enum UiState {
   UI_HYSTERESIS,
   UI_EDIT_TEMPERATURE,
   UI_CONFIRM_TEMPERATURE,
+  UI_SAFETY_MODE,
+  UI_SAFETY_DELTA,
   UI_ALARM_SETTINGS
 };
 UiState uiState = UI_HOME;
@@ -177,7 +183,17 @@ TempEditField tempEditField = EDIT_TARGET_TEMP;
 const char* menuItems[] = { "Incubation", "Status", "WiFi", "Settings", "Back" };
 const char* incubationMenuItems[] = { "Start", "Info", "Reset", "Back" };
 const char* wifiMenuItems[] = { "Connect", "Status", "Back" };
-const char* settingsItems[] = { "Set Temperature", "Heater Mode", "Hysteresis", "Alarms", "Back" };
+const char* settingsItems[] = {
+  "Set Temperature",
+  "Safety Mode",
+  "Safety Delta",  // 👈 NEW
+  "Heater Mode",
+  "Hysteresis",
+  "Alarms",
+  "Back"
+};
+
+
 const char* heaterModeItems[] = { "AUTO", "MANUAL" };
 
 int menuIndex = 0;
@@ -243,6 +259,17 @@ enum HeaterMode { HEATER_AUTO,
                   HEATER_MANUAL };
 HeaterMode heaterMode = HEATER_AUTO;
 
+// ================= SAFETY MODE =================
+enum SafetyMode {
+  SAFETY_AUTO,
+  SAFETY_MANUAL
+};
+SafetyMode safetyMode = SAFETY_AUTO;
+
+// Safety window for AUTO mode (± delta)
+float safetyDelta = 5.0;  // degrees C
+
+
 // ================== TIMERS ==================
 unsigned long lastUiActivity = 0;
 unsigned long lastHeaterUpdate = 0;
@@ -261,7 +288,7 @@ void temperatureTask() {
 
   // ---------- Request temperature ----------
   if (!tempRequested && now - lastTempRequest >= TEMP_INTERVAL) {
-    sensors.requestTemperatures();   // non-blocking
+    sensors.requestTemperatures();  // non-blocking
     tempRequestTime = now;
     tempRequested = true;
     lastTempRequest = now;
@@ -285,7 +312,7 @@ void temperatureTask() {
 
       liveTemp = filteredTemp;
       sensorValid = true;
-      sensorEverValid = true;   // ✅ mark sensor as seen OK at least once
+      sensorEverValid = true;  // ✅ mark sensor as seen OK at least once
 
     } else {
       // Sensor was previously valid → now fault
@@ -311,6 +338,28 @@ void safetyHardCutoff() {
     digitalWrite(HEATER_PIN, LOW);
     return;
   }
+}
+
+void updateAutoSafetyLimits() {
+
+  if (safetyMode != SAFETY_AUTO)
+    return;
+
+  minSafeTemp = setTemp - safetyDelta;
+  maxSafeTemp = setTemp + safetyDelta;
+
+  // Absolute clamps
+  minSafeTemp = constrain(minSafeTemp,
+                          TEMP_SAFE_MIN_MIN,
+                          TEMP_SAFE_MIN_MAX);
+
+  maxSafeTemp = constrain(maxSafeTemp,
+                          TEMP_SAFE_MAX_MIN,
+                          TEMP_SAFE_MAX_MAX);
+
+  // Ensure logical ordering
+  if (minSafeTemp >= maxSafeTemp - TEMP_MIN_GAP)
+    minSafeTemp = maxSafeTemp - TEMP_MIN_GAP;
 }
 
 
@@ -496,6 +545,10 @@ void loadSettingsFromEEPROM() {
     incubationStartEpoch = 0;
     incubationDay = 0;
     alarmsEnabled = true;  // 🔔 DEFAULT ENABLED
+    safetyMode = SAFETY_AUTO;
+    safetyDelta = 5.0;
+
+
 
     // -------- Write defaults + version --------
     EEPROM.put(ADDR_EEPROM_VERSION, EEPROM_VERSION);
@@ -511,6 +564,16 @@ void loadSettingsFromEEPROM() {
 
   EEPROM.get(ADDR_HEATER_MODE, eepromHeaterMode);
   EEPROM.get(ADDR_MANUAL_STATE, eepromManualState);
+
+  uint8_t sm = 0;
+  EEPROM.get(ADDR_SAFETY_MODE, sm);
+  safetyMode = (sm <= 1) ? (SafetyMode)sm : SAFETY_AUTO;
+
+  EEPROM.get(ADDR_SAFETY_DELTA, safetyDelta);
+  if (safetyDelta < 1.0 || safetyDelta > 10.0)
+    safetyDelta = 5.0;
+
+
 
   EEPROM.get(ADDR_MAX_SAFE_TEMP, maxSafeTemp);
   EEPROM.get(ADDR_MIN_SAFE_TEMP, minSafeTemp);
@@ -578,7 +641,8 @@ void loadSettingsFromEEPROM() {
   /* =========================================================
    * DERIVED RUNTIME CALCULATIONS
    * ========================================================= */
-
+  // Apply AUTO safety limits if enabled
+  updateAutoSafetyLimits();
   updateIncubationDay();
 }
 
@@ -659,6 +723,10 @@ void saveSettingsToEEPROM() {
   EEPROM.put(ADDR_MANUAL_STATE, eepromManualState);
   EEPROM.put(ADDR_INCUBATION_STARTED, (uint8_t)incubationStarted);
   EEPROM.put(ADDR_ALARMS_ENABLED, (uint8_t)alarmsEnabled);
+  EEPROM.put(ADDR_SAFETY_MODE, (uint8_t)safetyMode);
+  EEPROM.put(ADDR_SAFETY_DELTA, safetyDelta);
+
+
 
 
   // ================= MULTI-BYTE VALUES =================
@@ -815,6 +883,17 @@ void drawHome() {
   drawAlarmIcon();
   display.display();
 }
+void drawSafetyMode() {
+  drawHeader("SAFETY MODE");
+
+  display.setCursor(0, 28);
+  display.print(safetyMode == SAFETY_AUTO ? "> AUTO" : "  AUTO");
+
+  display.setCursor(0, 40);
+  display.print(safetyMode == SAFETY_MANUAL ? "> MANUAL" : "  MANUAL");
+
+  display.display();
+}
 
 void drawHomeWithAlarm() {
   display.clearDisplay();
@@ -876,6 +955,16 @@ void drawHomeWithAlarm() {
   display.display();
 }
 
+void drawSafetyDelta() {
+  drawHeader("SAFETY DELTA");
+
+  display.setCursor(0, 32);
+  display.print("Value: +-");
+  display.print(safetyDelta, 1);
+  display.print(" C");
+
+  display.display();
+}
 
 
 void drawAlarmSettings() {
@@ -1218,7 +1307,7 @@ void drawWifiMenu() {
 
 void drawSettings() {
   drawHeader("SETTINGS");
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 7; i++) {
     display.setCursor(0, 14 + i * 10);
     display.print(i == settingsIndex ? "> " : "  ");
     display.println(settingsItems[i]);
@@ -1520,7 +1609,7 @@ void loop() {
 
     // ===== SETTINGS =====
     else if (uiState == UI_SETTINGS) {
-      settingsIndex = (settingsIndex + enc + 5) % 5;
+      settingsIndex = (settingsIndex + enc + 7) % 7;
       drawSettings();
     }
 
@@ -1541,6 +1630,17 @@ void loop() {
     else if (uiState == UI_HYSTERESIS) {
       hysteresis = constrain(hysteresis + enc * 0.1, 0.1, 1.0);
       drawHysteresis();
+    }  // ===== SAFETY MODE =====
+    else if (uiState == UI_SAFETY_MODE) {
+      // Toggle AUTO <-> MANUAL
+      safetyMode = (safetyMode == SAFETY_AUTO)
+                     ? SAFETY_MANUAL
+                     : SAFETY_AUTO;
+
+      drawSafetyMode();
+    } else if (uiState == UI_SAFETY_DELTA) {
+      safetyDelta = constrain(safetyDelta + enc * 0.5, 1.0, 10.0);
+      drawSafetyDelta();
     } else if (uiState == UI_EDIT_TEMPERATURE) {
 
       if (tempEditField == EDIT_TARGET_TEMP) {
@@ -1753,7 +1853,9 @@ void loop() {
     // ===== SETTINGS =====
 
     else if (uiState == UI_SETTINGS) {
+
       if (settingsIndex == 0) {
+        // Set Temperature
         editTargetTemp = setTemp;
         editMaxSafeTemp = maxSafeTemp;
         editMinSafeTemp = minSafeTemp;
@@ -1761,19 +1863,42 @@ void loop() {
         tempEditField = EDIT_TARGET_TEMP;
         uiState = UI_EDIT_TEMPERATURE;
         drawEditTemperature();
-      } else if (settingsIndex == 1) {
+      }
+
+      else if (settingsIndex == 1) {
+        // ✅ SAFETY MODE (NEW)
+        uiState = UI_SAFETY_MODE;
+        drawSafetyMode();
+      }
+
+      else if (settingsIndex == 2) {
+        // Safety Delta (AUTO only)
+        if (safetyMode == SAFETY_AUTO) {
+          uiState = UI_SAFETY_DELTA;
+          drawSafetyDelta();
+        } else {
+          // MANUAL mode → skip
+          uiState = UI_SETTINGS;
+          drawSettings();
+        }
+      } else if (settingsIndex == 3) {
+        // Heater Mode
         uiState = UI_HEATER_MODE;
         drawHeaterMode();
-      } else if (settingsIndex == 2) {
+      } else if (settingsIndex == 4) {
+        // Hysteresis
         uiState = UI_HYSTERESIS;
         drawHysteresis();
-      } else if (settingsIndex == 3) {  // 🔔 ALARMS
+      } else if (settingsIndex == 5) {
+        // Alarms
         uiState = UI_ALARM_SETTINGS;
         drawAlarmSettings();
       } else {
+        // Back
         uiState = UI_MENU;
         drawMenu();
       }
+
     } else if (uiState == UI_ALARM_SETTINGS) {
       settingsDirty = true;
       uiState = UI_SETTINGS;
@@ -1783,30 +1908,50 @@ void loop() {
     // ===== EDIT TEMPERATURE =====
     else if (uiState == UI_EDIT_TEMPERATURE) {
 
-      tempEditField = (TempEditField)(tempEditField + 1);
+      if (safetyMode == SAFETY_AUTO) {
 
-      if (tempEditField == EDIT_TEMP_DONE) {
+        // AUTO mode: skip Min/Max editing
+        tempEditField = EDIT_TEMP_DONE;
+
         confirmStartIndex = 0;
         uiState = UI_CONFIRM_TEMPERATURE;
         drawConfirmTemperature();
       } else {
-        drawEditTemperature();
+        // MANUAL mode: normal flow
+        tempEditField = (TempEditField)(tempEditField + 1);
+
+        if (tempEditField == EDIT_TEMP_DONE) {
+          confirmStartIndex = 0;
+          uiState = UI_CONFIRM_TEMPERATURE;
+          drawConfirmTemperature();
+        } else {
+          drawEditTemperature();
+        }
       }
     }
+
 
     // ===== CONFIRM TEMPERATURE =====
     else if (uiState == UI_CONFIRM_TEMPERATURE) {
 
       if (confirmStartIndex == 0) {  // CONFIRM
         setTemp = editTargetTemp;
-        maxSafeTemp = editMaxSafeTemp;
-        minSafeTemp = editMinSafeTemp;
+
+        if (safetyMode == SAFETY_MANUAL) {
+          maxSafeTemp = editMaxSafeTemp;
+          minSafeTemp = editMinSafeTemp;
+        }
+
+        // AUTO mode recalculates safety window
+        updateAutoSafetyLimits();
+
         settingsDirty = true;
       }
 
       uiState = UI_SETTINGS;
       drawSettings();
     }
+
 
 
     // ===== HEATER MODE =====
@@ -1834,6 +1979,28 @@ void loop() {
 
     // ===== HYSTERESIS =====
     else if (uiState == UI_HYSTERESIS) {
+      settingsDirty = true;
+      uiState = UI_SETTINGS;
+      drawSettings();
+    }
+    // ===== SAFETY MODE CONFIRM =====
+    else if (uiState == UI_SAFETY_MODE) {
+
+      // If AUTO, calculate safety limits automatically
+      if (safetyMode == SAFETY_AUTO) {
+        updateAutoSafetyLimits();
+      }
+
+      // Mark settings for EEPROM save
+      settingsDirty = true;
+
+      // Go back to Settings menu
+      uiState = UI_SETTINGS;
+      drawSettings();
+    } else if (uiState == UI_SAFETY_DELTA) {
+
+      updateAutoSafetyLimits();  // recalc Min/Max
+
       settingsDirty = true;
       uiState = UI_SETTINGS;
       drawSettings();
