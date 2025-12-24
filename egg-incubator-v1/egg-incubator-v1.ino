@@ -111,6 +111,8 @@ unsigned long lastTempRequest = 0;
 unsigned long tempRequestTime = 0;
 bool tempRequested = false;
 const unsigned long TEMP_INTERVAL = 1000;
+uint8_t settingsPage = 0;  // 0 or 1
+
 
 // ================= ALARM ICON =================
 bool alarmBlinkState = false;
@@ -1307,15 +1309,26 @@ void drawWifiMenu() {
 
 void drawSettings() {
   drawHeader("SETTINGS");
-  for (int i = 0; i < 7; i++) {
-    display.setCursor(0, 14 + i * 10);
+
+  int startIndex = settingsPage == 0 ? 0 : 4;
+  int endIndex = settingsPage == 0 ? 4 : 7;
+
+  int row = 0;
+  for (int i = startIndex; i < endIndex; i++) {
+    display.setCursor(0, 14 + row * 10);
     display.print(i == settingsIndex ? "> " : "  ");
     display.println(settingsItems[i]);
+    row++;
   }
-  drawAlarmIcon();
 
+  // Page indicator
+  display.setCursor(110, 54);
+  display.print(settingsPage == 0 ? "1/2" : "2/2");
+
+  drawAlarmIcon();
   display.display();
 }
+
 
 void drawEditTemperature() {
   drawHeader("EDIT TEMPERATURE");
@@ -1610,8 +1623,13 @@ void loop() {
     // ===== SETTINGS =====
     else if (uiState == UI_SETTINGS) {
       settingsIndex = (settingsIndex + enc + 7) % 7;
+
+      // Auto page switch
+      settingsPage = (settingsIndex < 4) ? 0 : 1;
+
       drawSettings();
     }
+
 
 
     // ===== HEATER MODE =====
@@ -1730,6 +1748,7 @@ void loop() {
         drawWifiMenu();
       } else if (menuIndex == 3) {
         settingsIndex = 0;
+        settingsPage  = 0;   // ✅ RESET PAGE HERE
         uiState = UI_SETTINGS;
         drawSettings();
       } else {
