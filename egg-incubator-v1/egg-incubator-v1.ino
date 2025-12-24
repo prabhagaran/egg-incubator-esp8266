@@ -1309,12 +1309,60 @@ void drawStatusPage2() {
   drawAlarmIcon();
   display.display();
 }
+void drawStatusPage3() {
+  drawHeader("STATUS (3/3)");
+
+  // ---------- Safety Mode ----------
+  display.setCursor(0, 14);
+  display.print("Safety : ");
+  display.print(safetyMode == SAFETY_AUTO ? "AUTO" : "MANUAL");
+
+  // ---------- Safety Window / Limits ----------
+  display.setCursor(0, 26);
+
+  if (safetyMode == SAFETY_AUTO) {
+    display.print("Window : +-");
+    display.print(safetyDelta, 1);
+    display.print(" C");
+  } else {
+    display.print("Limits : ");
+    display.print(minSafeTemp, 1);
+    display.print(" - ");
+    display.print(maxSafeTemp, 1);
+    display.print(" C");
+  }
+
+  // ---------- Derived Limits (always useful) ----------
+  display.setCursor(0, 38);
+  display.print("MinSafe: ");
+  display.print(minSafeTemp, 1);
+  display.print(" C");
+
+  display.setCursor(0, 48);
+  display.print("MaxSafe: ");
+  display.print(maxSafeTemp, 1);
+  display.print(" C");
+
+  // ---------- Hard safety ----------
+  display.setCursor(0, 58);
+  display.print("HardMax: ");
+  display.print(TEMP_HARD_MAX, 1);
+  display.print(" C");
+
+  drawAlarmIcon();
+  display.display();
+}
+
+
 void drawStatus() {
   if (statusPage == 0)
     drawStatusPage1();
-  else
+  else if (statusPage == 1)
     drawStatusPage2();
+  else
+    drawStatusPage3();   // ✅ NEW
 }
+
 
 
 void drawWifiMenu() {
@@ -1630,7 +1678,7 @@ void loop() {
       }
       drawEditStartDateTime();
     } else if (uiState == UI_STATUS) {
-      statusPage = (statusPage + enc + 2) % 2;
+      statusPage = (statusPage + enc + 3) % 3;
       drawStatus();
     }
 
