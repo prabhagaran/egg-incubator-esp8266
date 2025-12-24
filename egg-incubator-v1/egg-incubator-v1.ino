@@ -66,6 +66,9 @@ const float TEMP_SET_GAP = 0.2;  // SetTemp inside safety
 
 unsigned long sensorStartupTime = 0;
 bool sensorEverValid = false;
+uint8_t sensorFailCount = 0;
+const uint8_t SENSOR_FAIL_THRESHOLD = 3;
+
 
 
 
@@ -112,6 +115,8 @@ unsigned long tempRequestTime = 0;
 bool tempRequested = false;
 const unsigned long TEMP_INTERVAL = 1000;
 uint8_t settingsPage = 0;  // 0 or 1
+bool sensorRecovered = false;
+
 
 
 // ================= ALARM ICON =================
@@ -288,24 +293,25 @@ WiFiManager wm;
 void temperatureTask() {
   unsigned long now = millis();
 
-  // ---------- Request temperature ----------
-  if (!tempRequested && now - lastTempRequest >= TEMP_INTERVAL) {
-    sensors.requestTemperatures();  // non-blocking
+  // ---------- Request temperature (non-blocking) ----------
+  if (!tempRequested && (now - lastTempRequest >= TEMP_INTERVAL)) {
+    sensors.requestTemperatures();  // start conversion
     tempRequestTime = now;
     tempRequested = true;
     lastTempRequest = now;
   }
 
   // ---------- Read temperature ----------
-  if (tempRequested && now - tempRequestTime >= 750) {
+  if (tempRequested && (now - tempRequestTime >= 750)) {
 
     float t = sensors.getTempCByIndex(0);
 
+    // ---------- Valid reading ----------
     if (t != DEVICE_DISCONNECTED_C && t > -40.0 && t < 100.0) {
 
       rawTemp = t;
 
-      // 🔑 Filter initialization on first valid sample
+      // First valid sample initializes filter
       if (!sensorEverValid) {
         filteredTemp = rawTemp;
       } else {
@@ -313,17 +319,29 @@ void temperatureTask() {
       }
 
       liveTemp = filteredTemp;
-      sensorValid = true;
-      sensorEverValid = true;  // ✅ mark sensor as seen OK at least once
 
-    } else {
-      // Sensor was previously valid → now fault
-      sensorValid = false;
+      sensorValid = true;
+      sensorEverValid = true;
+      sensorFailCount = 0;
+      sensorRecovered = true;  // ✅ mark immediate recovery
+                               // ✅ reset failure counter
+    }
+    // ---------- Invalid reading ----------
+    else {
+      if (sensorFailCount < 255)
+        sensorFailCount++;
+
+      // Declare sensor fault ONLY after consecutive failures
+      if (sensorFailCount >= SENSOR_FAIL_THRESHOLD) {
+        sensorValid = false;
+      }
+      // else: ignore transient glitch
     }
 
     tempRequested = false;
   }
 }
+
 
 void safetyHardCutoff() {
 
@@ -425,10 +443,11 @@ void updateAlarms() {
   }
 
   // ---------- Sensor fault (after it was once valid) ----------
-  if (!sensorValid) {
-    activeAlarm = ALARM_SENSOR_FAULT;
-    return;
-  }
+  if (!sensorValid && !sensorRecovered) {
+  activeAlarm = ALARM_SENSOR_FAULT;
+  return;
+}
+
 
   // ---------- Over-temperature ----------
   if (liveTemp >= maxSafeTemp) {
@@ -444,6 +463,8 @@ void updateAlarms() {
 
   // ---------- No alarm ----------
   activeAlarm = ALARM_NONE;
+  sensorRecovered = false;
+
 }
 
 
@@ -1748,7 +1769,7 @@ void loop() {
         drawWifiMenu();
       } else if (menuIndex == 3) {
         settingsIndex = 0;
-        settingsPage  = 0;   // ✅ RESET PAGE HERE
+        settingsPage = 0;  // ✅ RESET PAGE HERE
         uiState = UI_SETTINGS;
         drawSettings();
       } else {
