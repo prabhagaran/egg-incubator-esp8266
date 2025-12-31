@@ -32,6 +32,10 @@
 #define ADDR_MAX_SAFE_TEMP 16
 #define ADDR_MIN_SAFE_TEMP 20
 #define ADDR_ALARMS_ENABLED 24  // uint8_t
+#define ADDR_SAFETY_MODE 25     // uint8_t
+#define ADDR_SAFETY_DELTA 26    // float (4 bytes)
+
+
 
 
 
@@ -40,6 +44,33 @@ bool settingsDirty = false;
 
 uint8_t eepromHeaterMode = 0;
 uint8_t eepromManualState = 0;
+
+// ================= TEMPERATURE LIMITS =================
+
+// Absolute hardware limit (never user editable)
+const float TEMP_HARD_MAX = 45.0;
+
+// User adjustable limits
+const float TEMP_SET_MIN = 15.0;
+const float TEMP_SET_MAX = 45.0;
+
+const float TEMP_SAFE_MIN_MIN = 10.0;
+const float TEMP_SAFE_MIN_MAX = 40.0;
+
+const float TEMP_SAFE_MAX_MIN = 20.0;
+const float TEMP_SAFE_MAX_MAX = 45.0;
+
+// Logical separation margins
+const float TEMP_MIN_GAP = 0.5;  // MinSafe < MaxSafe
+const float TEMP_SET_GAP = 0.2;  // SetTemp inside safety
+
+unsigned long sensorStartupTime = 0;
+bool sensorEverValid = false;
+uint8_t sensorFailCount = 0;
+const uint8_t SENSOR_FAIL_THRESHOLD = 3;
+
+
+
 
 // ================= NTP =================
 
@@ -83,6 +114,10 @@ unsigned long lastTempRequest = 0;
 unsigned long tempRequestTime = 0;
 bool tempRequested = false;
 const unsigned long TEMP_INTERVAL = 1000;
+uint8_t settingsPage = 0;  // 0 or 1
+bool sensorRecovered = false;
+
+
 
 // ================= ALARM ICON =================
 bool alarmBlinkState = false;
@@ -91,13 +126,12 @@ const unsigned long ALARM_BLINK_INTERVAL = 250;  // ms
 
 // ================= ALARM LATCH TIMING =================
 unsigned long alarmActiveSince = 0;
-const unsigned long ALARM_LATCH_DELAY = 3000; // ms
+const unsigned long ALARM_LATCH_DELAY = 3000;  // ms
 
-// ================= HARD SAFETY LIMIT =================
-#define HARD_MAX_TEMP 45.0  // Absolute safety cut-off (°C)
+
 
 // ================= HEATER STRESS PROTECTION =================
-const unsigned long MIN_HEATER_ON_TIME  = 5000;  // ms
+const unsigned long MIN_HEATER_ON_TIME = 5000;   // ms
 const unsigned long MIN_HEATER_OFF_TIME = 5000;  // ms
 unsigned long heaterStateSince = 0;
 
@@ -119,6 +153,8 @@ enum UiState {
   UI_HYSTERESIS,
   UI_EDIT_TEMPERATURE,
   UI_CONFIRM_TEMPERATURE,
+  UI_SAFETY_MODE,
+  UI_SAFETY_DELTA,
   UI_ALARM_SETTINGS
 };
 UiState uiState = UI_HOME;
@@ -154,7 +190,17 @@ TempEditField tempEditField = EDIT_TARGET_TEMP;
 const char* menuItems[] = { "Incubation", "Status", "WiFi", "Settings", "Back" };
 const char* incubationMenuItems[] = { "Start", "Info", "Reset", "Back" };
 const char* wifiMenuItems[] = { "Connect", "Status", "Back" };
-const char* settingsItems[] = { "Set Temperature", "Heater Mode", "Hysteresis", "Alarms", "Back" };
+const char* settingsItems[] = {
+  "Set Temperature",
+  "Safety Mode",
+  "Safety Delta",  // 👈 NEW
+  "Heater Mode",
+  "Hysteresis",
+  "Alarms",
+  "Back"
+};
+
+
 const char* heaterModeItems[] = { "AUTO", "MANUAL" };
 
 int menuIndex = 0;
@@ -220,6 +266,17 @@ enum HeaterMode { HEATER_AUTO,
                   HEATER_MANUAL };
 HeaterMode heaterMode = HEATER_AUTO;
 
+// ================= SAFETY MODE =================
+enum SafetyMode {
+  SAFETY_AUTO,
+  SAFETY_MANUAL
+};
+SafetyMode safetyMode = SAFETY_AUTO;
+
+// Safety window for AUTO mode (± delta)
+float safetyDelta = 5.0;  // degrees C
+
+
 // ================== TIMERS ==================
 unsigned long lastUiActivity = 0;
 unsigned long lastHeaterUpdate = 0;
@@ -236,37 +293,56 @@ WiFiManager wm;
 void temperatureTask() {
   unsigned long now = millis();
 
-  // ---------- Request temperature ----------
-  if (!tempRequested && now - lastTempRequest >= TEMP_INTERVAL) {
-    sensors.requestTemperatures();
+  // ---------- Request temperature (non-blocking) ----------
+  if (!tempRequested && (now - lastTempRequest >= TEMP_INTERVAL)) {
+    sensors.requestTemperatures();  // start conversion
     tempRequestTime = now;
     tempRequested = true;
     lastTempRequest = now;
   }
 
   // ---------- Read temperature ----------
-  if (tempRequested && now - tempRequestTime >= 750) {
+  if (tempRequested && (now - tempRequestTime >= 750)) {
+
     float t = sensors.getTempCByIndex(0);
 
+    // ---------- Valid reading ----------
     if (t != DEVICE_DISCONNECTED_C && t > -40.0 && t < 100.0) {
+
       rawTemp = t;
 
-      // 🔑 Proper filter initialization
-      if (!sensorValid) {
-        filteredTemp = rawTemp;  // first valid sample
+      // First valid sample initializes filter
+      if (!sensorEverValid) {
+        filteredTemp = rawTemp;
       } else {
         filteredTemp = (filteredTemp * 0.7f) + (rawTemp * 0.3f);
       }
 
       liveTemp = filteredTemp;
+
       sensorValid = true;
-    } else {
-      sensorValid = false;
+      sensorEverValid = true;
+      sensorFailCount = 0;
+      sensorRecovered = true;  // ✅ mark immediate recovery
+                               // ✅ reset failure counter
+    }
+    // ---------- Invalid reading ----------
+    else {
+      if (sensorFailCount < 255)
+        sensorFailCount++;
+
+      // Declare sensor fault ONLY after consecutive failures
+      if (sensorFailCount >= SENSOR_FAIL_THRESHOLD) {
+        sensorValid = false;
+      }
+      // else: ignore transient glitch
     }
 
     tempRequested = false;
   }
 }
+
+
 void safetyHardCutoff() {
 
   // Sensor invalid → heater OFF
@@ -277,11 +353,33 @@ void safetyHardCutoff() {
   }
 
   // Absolute over-temperature → heater OFF
-  if (liveTemp >= HARD_MAX_TEMP) {
+  if (liveTemp >= TEMP_HARD_MAX) {
     heaterOn = false;
     digitalWrite(HEATER_PIN, LOW);
     return;
   }
+}
+
+void updateAutoSafetyLimits() {
+
+  if (safetyMode != SAFETY_AUTO)
+    return;
+
+  minSafeTemp = setTemp - safetyDelta;
+  maxSafeTemp = setTemp + safetyDelta;
+
+  // Absolute clamps
+  minSafeTemp = constrain(minSafeTemp,
+                          TEMP_SAFE_MIN_MIN,
+                          TEMP_SAFE_MIN_MAX);
+
+  maxSafeTemp = constrain(maxSafeTemp,
+                          TEMP_SAFE_MAX_MIN,
+                          TEMP_SAFE_MAX_MAX);
+
+  // Ensure logical ordering
+  if (minSafeTemp >= maxSafeTemp - TEMP_MIN_GAP)
+    minSafeTemp = maxSafeTemp - TEMP_MIN_GAP;
 }
 
 
@@ -331,28 +429,44 @@ void updateHeaterControl() {
 
 void updateAlarms() {
 
+  // ---------- Alarms globally disabled ----------
   if (!alarmsEnabled) {
     activeAlarm = ALARM_NONE;
     return;
   }
 
-  if (!sensorValid) {
-    activeAlarm = ALARM_SENSOR_FAULT;
+  // ---------- Ignore sensor fault until first valid reading ----------
+  // This prevents false SENSOR ERROR at boot
+  if (!sensorEverValid) {
+    activeAlarm = ALARM_NONE;
     return;
   }
 
+  // ---------- Sensor fault (after it was once valid) ----------
+  if (!sensorValid && !sensorRecovered) {
+  activeAlarm = ALARM_SENSOR_FAULT;
+  return;
+}
+
+
+  // ---------- Over-temperature ----------
   if (liveTemp >= maxSafeTemp) {
     activeAlarm = ALARM_OVER_TEMP;
     return;
   }
 
+  // ---------- Under-temperature ----------
   if (liveTemp <= minSafeTemp) {
     activeAlarm = ALARM_UNDER_TEMP;
     return;
   }
 
+  // ---------- No alarm ----------
   activeAlarm = ALARM_NONE;
+  sensorRecovered = false;
+
 }
+
 
 
 void updateAlarmFSM() {
@@ -367,7 +481,7 @@ void updateAlarmFSM() {
 
     case ALARM_STATE_NONE:
       if (activeAlarm != ALARM_NONE) {
-        alarmActiveSince = millis();          // ⏱ start timing
+        alarmActiveSince = millis();  // ⏱ start timing
         alarmState = ALARM_STATE_ACTIVE;
       }
       break;
@@ -382,10 +496,7 @@ void updateAlarmFSM() {
 
       // Critical alarms → latch only after delay
       else if (
-        (activeAlarm == ALARM_SENSOR_FAULT ||
-         activeAlarm == ALARM_OVER_TEMP) &&
-        (millis() - alarmActiveSince >= ALARM_LATCH_DELAY)
-      ) {
+        (activeAlarm == ALARM_SENSOR_FAULT || activeAlarm == ALARM_OVER_TEMP) && (millis() - alarmActiveSince >= ALARM_LATCH_DELAY)) {
         alarmState = ALARM_STATE_LATCHED;
       }
       break;
@@ -457,6 +568,10 @@ void loadSettingsFromEEPROM() {
     incubationStartEpoch = 0;
     incubationDay = 0;
     alarmsEnabled = true;  // 🔔 DEFAULT ENABLED
+    safetyMode = SAFETY_AUTO;
+    safetyDelta = 5.0;
+
+
 
     // -------- Write defaults + version --------
     EEPROM.put(ADDR_EEPROM_VERSION, EEPROM_VERSION);
@@ -473,6 +588,16 @@ void loadSettingsFromEEPROM() {
   EEPROM.get(ADDR_HEATER_MODE, eepromHeaterMode);
   EEPROM.get(ADDR_MANUAL_STATE, eepromManualState);
 
+  uint8_t sm = 0;
+  EEPROM.get(ADDR_SAFETY_MODE, sm);
+  safetyMode = (sm <= 1) ? (SafetyMode)sm : SAFETY_AUTO;
+
+  EEPROM.get(ADDR_SAFETY_DELTA, safetyDelta);
+  if (safetyDelta < 1.0 || safetyDelta > 10.0)
+    safetyDelta = 5.0;
+
+
+
   EEPROM.get(ADDR_MAX_SAFE_TEMP, maxSafeTemp);
   EEPROM.get(ADDR_MIN_SAFE_TEMP, minSafeTemp);
 
@@ -480,21 +605,33 @@ void loadSettingsFromEEPROM() {
    * SAFETY LIMIT VALIDATION (CRITICAL)
    * ========================================================= */
 
-  if (maxSafeTemp < 38.0 || maxSafeTemp > 42.0)
-    maxSafeTemp = 39.5;
+  /* =========================================================
+ * SAFETY LIMIT VALIDATION (CRITICAL)
+ * ========================================================= */
 
-  if (minSafeTemp < 30.0 || minSafeTemp > 37.0)
-    minSafeTemp = 35.0;
+  if (maxSafeTemp < TEMP_SAFE_MAX_MIN || maxSafeTemp > TEMP_SAFE_MAX_MAX)
+    maxSafeTemp = 40.0;
 
-  if (minSafeTemp >= maxSafeTemp - 0.5)
-    minSafeTemp = maxSafeTemp - 0.5;
+  if (minSafeTemp < TEMP_SAFE_MIN_MIN || minSafeTemp > TEMP_SAFE_MIN_MAX)
+    minSafeTemp = 15.0;
+
+  // Ensure logical ordering
+  if (minSafeTemp >= maxSafeTemp - TEMP_MIN_GAP)
+    minSafeTemp = maxSafeTemp - TEMP_MIN_GAP;
 
   /* =========================================================
-   * CONTROL SETPOINT VALIDATION
-   * ========================================================= */
+ * CONTROL SETPOINT VALIDATION
+ * ========================================================= */
 
-  if (setTemp < 30.0 || setTemp > 40.0)
+  if (setTemp < TEMP_SET_MIN || setTemp > TEMP_SET_MAX)
     setTemp = 37.5;
+
+  // Ensure setpoint is inside safety window
+  if (setTemp >= maxSafeTemp)
+    setTemp = maxSafeTemp - TEMP_SET_GAP;
+
+  if (setTemp <= minSafeTemp)
+    setTemp = minSafeTemp + TEMP_SET_GAP;
 
   if (hysteresis < 0.1 || hysteresis > 1.0)
     hysteresis = 0.3;
@@ -527,7 +664,8 @@ void loadSettingsFromEEPROM() {
   /* =========================================================
    * DERIVED RUNTIME CALCULATIONS
    * ========================================================= */
-
+  // Apply AUTO safety limits if enabled
+  updateAutoSafetyLimits();
   updateIncubationDay();
 }
 
@@ -608,6 +746,10 @@ void saveSettingsToEEPROM() {
   EEPROM.put(ADDR_MANUAL_STATE, eepromManualState);
   EEPROM.put(ADDR_INCUBATION_STARTED, (uint8_t)incubationStarted);
   EEPROM.put(ADDR_ALARMS_ENABLED, (uint8_t)alarmsEnabled);
+  EEPROM.put(ADDR_SAFETY_MODE, (uint8_t)safetyMode);
+  EEPROM.put(ADDR_SAFETY_DELTA, safetyDelta);
+
+
 
 
   // ================= MULTI-BYTE VALUES =================
@@ -646,10 +788,9 @@ void drawAlarmIcon() {
 
     display.drawTriangle(
       x + 4, y + 2,
-      x,     y + 10,
+      x, y + 10,
       x + 8, y + 10,
-      SSD1306_WHITE
-    );
+      SSD1306_WHITE);
     display.drawLine(x + 4, y + 5, x + 4, y + 8, SSD1306_WHITE);
     display.drawPixel(x + 4, y + 9, SSD1306_WHITE);
   }
@@ -765,6 +906,17 @@ void drawHome() {
   drawAlarmIcon();
   display.display();
 }
+void drawSafetyMode() {
+  drawHeader("SAFETY MODE");
+
+  display.setCursor(0, 28);
+  display.print(safetyMode == SAFETY_AUTO ? "> AUTO" : "  AUTO");
+
+  display.setCursor(0, 40);
+  display.print(safetyMode == SAFETY_MANUAL ? "> MANUAL" : "  MANUAL");
+
+  display.display();
+}
 
 void drawHomeWithAlarm() {
   display.clearDisplay();
@@ -826,6 +978,16 @@ void drawHomeWithAlarm() {
   display.display();
 }
 
+void drawSafetyDelta() {
+  drawHeader("SAFETY DELTA");
+
+  display.setCursor(0, 32);
+  display.print("Value: +-");
+  display.print(safetyDelta, 1);
+  display.print(" C");
+
+  display.display();
+}
 
 
 void drawAlarmSettings() {
@@ -1147,12 +1309,60 @@ void drawStatusPage2() {
   drawAlarmIcon();
   display.display();
 }
+void drawStatusPage3() {
+  drawHeader("STATUS (3/3)");
+
+  // ---------- Safety Mode ----------
+  display.setCursor(0, 14);
+  display.print("Safety : ");
+  display.print(safetyMode == SAFETY_AUTO ? "AUTO" : "MANUAL");
+
+  // ---------- Safety Window / Limits ----------
+  display.setCursor(0, 26);
+
+  if (safetyMode == SAFETY_AUTO) {
+    display.print("Window : +-");
+    display.print(safetyDelta, 1);
+    display.print(" C");
+  } else {
+    display.print("Limits : ");
+    display.print(minSafeTemp, 1);
+    display.print(" - ");
+    display.print(maxSafeTemp, 1);
+    display.print(" C");
+  }
+
+  // ---------- Derived Limits (always useful) ----------
+  display.setCursor(0, 38);
+  display.print("MinSafe: ");
+  display.print(minSafeTemp, 1);
+  display.print(" C");
+
+  display.setCursor(0, 48);
+  display.print("MaxSafe: ");
+  display.print(maxSafeTemp, 1);
+  display.print(" C");
+
+  // ---------- Hard safety ----------
+  display.setCursor(0, 58);
+  display.print("HardMax: ");
+  display.print(TEMP_HARD_MAX, 1);
+  display.print(" C");
+
+  drawAlarmIcon();
+  display.display();
+}
+
+
 void drawStatus() {
   if (statusPage == 0)
     drawStatusPage1();
-  else
+  else if (statusPage == 1)
     drawStatusPage2();
+  else
+    drawStatusPage3();   // ✅ NEW
 }
+
 
 
 void drawWifiMenu() {
@@ -1168,15 +1378,26 @@ void drawWifiMenu() {
 
 void drawSettings() {
   drawHeader("SETTINGS");
-  for (int i = 0; i < 5; i++) {
-    display.setCursor(0, 14 + i * 10);
+
+  int startIndex = settingsPage == 0 ? 0 : 4;
+  int endIndex = settingsPage == 0 ? 4 : 7;
+
+  int row = 0;
+  for (int i = startIndex; i < endIndex; i++) {
+    display.setCursor(0, 14 + row * 10);
     display.print(i == settingsIndex ? "> " : "  ");
     display.println(settingsItems[i]);
+    row++;
   }
-  drawAlarmIcon();
 
+  // Page indicator
+  display.setCursor(110, 54);
+  display.print(settingsPage == 0 ? "1/2" : "2/2");
+
+  drawAlarmIcon();
   display.display();
 }
+
 
 void drawEditTemperature() {
   drawHeader("EDIT TEMPERATURE");
@@ -1294,7 +1515,6 @@ void startIncubationFromEdit() {
 
   updateIncubationDay();
   settingsDirty = true;
-
 }
 
 
@@ -1311,6 +1531,8 @@ void setup() {
   heaterOn = false;
   manualHeaterOn = false;
   heaterStateSince = millis();
+  sensorStartupTime = millis();
+  sensorEverValid = false;
 
 
 
@@ -1368,21 +1590,21 @@ void loop() {
 
   // ---------- Heater + screen refresh ----------
   // ---------- Heater + Alarm refresh ----------
-if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
-  lastHeaterUpdate = millis();
+  if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
+    lastHeaterUpdate = millis();
 
-  updateAlarms();
-  updateAlarmFSM();
+    updateAlarms();
+    updateAlarmFSM();
 
-  safetyHardCutoff();   // 🔒 ABSOLUTE SAFETY FIRST
+    safetyHardCutoff();  // 🔒 ABSOLUTE SAFETY FIRST
 
-  if (alarmState == ALARM_STATE_LATCHED) {
-    heaterOn = false;
-    digitalWrite(HEATER_PIN, LOW);
-  } else {
-    updateHeaterControl();
+    if (alarmState == ALARM_STATE_LATCHED) {
+      heaterOn = false;
+      digitalWrite(HEATER_PIN, LOW);
+    } else {
+      updateHeaterControl();
+    }
   }
-}
 
 
 
@@ -1456,7 +1678,7 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
       }
       drawEditStartDateTime();
     } else if (uiState == UI_STATUS) {
-      statusPage = (statusPage + enc + 2) % 2;
+      statusPage = (statusPage + enc + 3) % 3;
       drawStatus();
     }
 
@@ -1469,9 +1691,14 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
 
     // ===== SETTINGS =====
     else if (uiState == UI_SETTINGS) {
-      settingsIndex = (settingsIndex + enc + 5) % 5;
+      settingsIndex = (settingsIndex + enc + 7) % 7;
+
+      // Auto page switch
+      settingsPage = (settingsIndex < 4) ? 0 : 1;
+
       drawSettings();
     }
+
 
 
     // ===== HEATER MODE =====
@@ -1490,25 +1717,46 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
     else if (uiState == UI_HYSTERESIS) {
       hysteresis = constrain(hysteresis + enc * 0.1, 0.1, 1.0);
       drawHysteresis();
+    }  // ===== SAFETY MODE =====
+    else if (uiState == UI_SAFETY_MODE) {
+      // Toggle AUTO <-> MANUAL
+      safetyMode = (safetyMode == SAFETY_AUTO)
+                     ? SAFETY_MANUAL
+                     : SAFETY_AUTO;
+
+      drawSafetyMode();
+    } else if (uiState == UI_SAFETY_DELTA) {
+      safetyDelta = constrain(safetyDelta + enc * 0.5, 1.0, 10.0);
+      drawSafetyDelta();
     } else if (uiState == UI_EDIT_TEMPERATURE) {
 
       if (tempEditField == EDIT_TARGET_TEMP) {
-        editTargetTemp = constrain(editTargetTemp + enc * 0.1, 30.0, 40.0);
+        editTargetTemp = constrain(
+          editTargetTemp + enc * 0.1,
+          TEMP_SET_MIN,
+          TEMP_SET_MAX);
       } else if (tempEditField == EDIT_MAX_SAFE_TEMP) {
-        editMaxSafeTemp = constrain(editMaxSafeTemp + enc * 0.1, 38.0, 42.0);
+        editMaxSafeTemp = constrain(
+          editMaxSafeTemp + enc * 0.1,
+          TEMP_SAFE_MAX_MIN,
+          TEMP_SAFE_MAX_MAX);
       } else if (tempEditField == EDIT_MIN_SAFE_TEMP) {
-        editMinSafeTemp = constrain(editMinSafeTemp + enc * 0.1, 30.0, 37.0);
+        editMinSafeTemp = constrain(
+          editMinSafeTemp + enc * 0.1,
+          TEMP_SAFE_MIN_MIN,
+          TEMP_SAFE_MIN_MAX);
       }
 
       // 🔒 Safety rules (enforced live)
-      if (editMinSafeTemp >= editMaxSafeTemp - 0.5)
-        editMinSafeTemp = editMaxSafeTemp - 0.5;
+      if (editMinSafeTemp >= editMaxSafeTemp - TEMP_MIN_GAP)
+        editMinSafeTemp = editMaxSafeTemp - TEMP_MIN_GAP;
 
       if (editTargetTemp >= editMaxSafeTemp)
-        editTargetTemp = editMaxSafeTemp - 0.2;
+        editTargetTemp = editMaxSafeTemp - TEMP_SET_GAP;
 
       if (editTargetTemp <= editMinSafeTemp)
-        editTargetTemp = editMinSafeTemp + 0.2;
+        editTargetTemp = editMinSafeTemp + TEMP_SET_GAP;
+
 
       drawEditTemperature();
     } else if (uiState == UI_CONFIRM_TEMPERATURE) {
@@ -1569,6 +1817,7 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
         drawWifiMenu();
       } else if (menuIndex == 3) {
         settingsIndex = 0;
+        settingsPage = 0;  // ✅ RESET PAGE HERE
         uiState = UI_SETTINGS;
         drawSettings();
       } else {
@@ -1606,7 +1855,7 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
         incubationStarted = false;
         incubationDay = 0;
         incubationStartEpoch = 0;  // 🔒 CLEAR STORED TIME
-       settingsDirty = true;
+        settingsDirty = true;
         drawIncubationMenu();
       }
 
@@ -1692,7 +1941,9 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
     // ===== SETTINGS =====
 
     else if (uiState == UI_SETTINGS) {
+
       if (settingsIndex == 0) {
+        // Set Temperature
         editTargetTemp = setTemp;
         editMaxSafeTemp = maxSafeTemp;
         editMinSafeTemp = minSafeTemp;
@@ -1700,19 +1951,42 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
         tempEditField = EDIT_TARGET_TEMP;
         uiState = UI_EDIT_TEMPERATURE;
         drawEditTemperature();
-      } else if (settingsIndex == 1) {
+      }
+
+      else if (settingsIndex == 1) {
+        // ✅ SAFETY MODE (NEW)
+        uiState = UI_SAFETY_MODE;
+        drawSafetyMode();
+      }
+
+      else if (settingsIndex == 2) {
+        // Safety Delta (AUTO only)
+        if (safetyMode == SAFETY_AUTO) {
+          uiState = UI_SAFETY_DELTA;
+          drawSafetyDelta();
+        } else {
+          // MANUAL mode → skip
+          uiState = UI_SETTINGS;
+          drawSettings();
+        }
+      } else if (settingsIndex == 3) {
+        // Heater Mode
         uiState = UI_HEATER_MODE;
         drawHeaterMode();
-      } else if (settingsIndex == 2) {
+      } else if (settingsIndex == 4) {
+        // Hysteresis
         uiState = UI_HYSTERESIS;
         drawHysteresis();
-      } else if (settingsIndex == 3) {  // 🔔 ALARMS
+      } else if (settingsIndex == 5) {
+        // Alarms
         uiState = UI_ALARM_SETTINGS;
         drawAlarmSettings();
       } else {
+        // Back
         uiState = UI_MENU;
         drawMenu();
       }
+
     } else if (uiState == UI_ALARM_SETTINGS) {
       settingsDirty = true;
       uiState = UI_SETTINGS;
@@ -1722,30 +1996,50 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
     // ===== EDIT TEMPERATURE =====
     else if (uiState == UI_EDIT_TEMPERATURE) {
 
-      tempEditField = (TempEditField)(tempEditField + 1);
+      if (safetyMode == SAFETY_AUTO) {
 
-      if (tempEditField == EDIT_TEMP_DONE) {
+        // AUTO mode: skip Min/Max editing
+        tempEditField = EDIT_TEMP_DONE;
+
         confirmStartIndex = 0;
         uiState = UI_CONFIRM_TEMPERATURE;
         drawConfirmTemperature();
       } else {
-        drawEditTemperature();
+        // MANUAL mode: normal flow
+        tempEditField = (TempEditField)(tempEditField + 1);
+
+        if (tempEditField == EDIT_TEMP_DONE) {
+          confirmStartIndex = 0;
+          uiState = UI_CONFIRM_TEMPERATURE;
+          drawConfirmTemperature();
+        } else {
+          drawEditTemperature();
+        }
       }
     }
+
 
     // ===== CONFIRM TEMPERATURE =====
     else if (uiState == UI_CONFIRM_TEMPERATURE) {
 
       if (confirmStartIndex == 0) {  // CONFIRM
         setTemp = editTargetTemp;
-        maxSafeTemp = editMaxSafeTemp;
-        minSafeTemp = editMinSafeTemp;
+
+        if (safetyMode == SAFETY_MANUAL) {
+          maxSafeTemp = editMaxSafeTemp;
+          minSafeTemp = editMinSafeTemp;
+        }
+
+        // AUTO mode recalculates safety window
+        updateAutoSafetyLimits();
+
         settingsDirty = true;
       }
 
       uiState = UI_SETTINGS;
       drawSettings();
     }
+
 
 
     // ===== HEATER MODE =====
@@ -1773,7 +2067,29 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
 
     // ===== HYSTERESIS =====
     else if (uiState == UI_HYSTERESIS) {
-     settingsDirty = true;
+      settingsDirty = true;
+      uiState = UI_SETTINGS;
+      drawSettings();
+    }
+    // ===== SAFETY MODE CONFIRM =====
+    else if (uiState == UI_SAFETY_MODE) {
+
+      // If AUTO, calculate safety limits automatically
+      if (safetyMode == SAFETY_AUTO) {
+        updateAutoSafetyLimits();
+      }
+
+      // Mark settings for EEPROM save
+      settingsDirty = true;
+
+      // Go back to Settings menu
+      uiState = UI_SETTINGS;
+      drawSettings();
+    } else if (uiState == UI_SAFETY_DELTA) {
+
+      updateAutoSafetyLimits();  // recalc Min/Max
+
+      settingsDirty = true;
       uiState = UI_SETTINGS;
       drawSettings();
     }
@@ -1789,5 +2105,4 @@ if (millis() - lastHeaterUpdate > HEATER_INTERVAL) {
     drawHome();
   }
   commitSettingsIfDirty();
-
 }
